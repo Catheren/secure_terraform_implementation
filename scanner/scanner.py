@@ -1,247 +1,85 @@
 #!/usr/bin/env python3
 """
-Detects if the terraform script fails to follow 
-any custom requirements of the org.
+Very simple Terraform security scanner.
 
-Enforces organization-specific policies that generic tools
-(tfsec, Checkov) cannot know about. Designed to run as a
-GitHub Actions job and block PRs that violate internal standards.
-   
-Rules Enforced: 
-TAG-001 — Required tags on every resource
-         (Environment, Owner, Project, DataClassification)
+Checks every .tf file in the current folder (and subfolders) for 5 problems:
+  1. Missing required tags
+  2. Resource names not following project-env-purpose pattern
+  3. Regions outside us-east-1 / us-west-2
+  4. Hardcoded 12-digit AWS account IDs
+  5. S3 buckets with no logging resource
 
-NAME-001 — Naming convention enforcement
-         (all resources must follow: lab-{env}-{purpose})
-
-RGN-001 — Approved regions only
-         (only us-east-1 and us-west-2 allowed — no accidental
-          deployments to regions outside your compliance boundary)
-
-ACCT-001 — No hardcoded account IDs
-         (should use variables, not literal AWS account numbers)
-
-S3-001 — Every S3 bucket must have a logging target defined
-         (tfsec checks encryption — you check logging destination)
+Usage:
+  python simple_scanner.py
 """
-import argparse
+
 import re
 import sys
 from pathlib import Path
 
-REQUIRED_TAGS = {"Environment", "Owner", "Project", "DataClassification"}
-APPROVED_REGIONS = {"us-east-1", "us-west-2"}
-NAMING_PATTERN = r'^([a-zA-Z0-9]+)-([a-zA-Z0-9]+)-([a-zA-Z0-9]+)$'
-ACCOUNT_ID_PATTERN = r'"\d{12}"'
+REQUIRED_TAGS = ["Environment", "Owner", "Project", "DataClassification"]
+APPROVED_REGIONS = ["us-east-1", "us-west-2"]
 
-def find_tf_files(path):
-    return list(Path(path).rglob("*.tf"))
+problem_count = 0
+serious_problem_count = 0  # CRITICAL or HIGH — these should fail the pipeline
 
 
-
-def make_finding(severity, rule_id, title, file, line, remediation):
-    return {
-        "severity": severity,
-        "rule_id": rule_id,
-        "title": title,
-        "file": file,
-        "line": line,
-        "remediation": remediation
-    }
+def report(level, message, filename):
+    """Print one problem and keep count."""
+    global problem_count, serious_problem_count
+    problem_count += 1
+    if level in ("CRITICAL", "HIGH"):
+        serious_problem_count += 1
+    print(f"[{level}] {filename}: {message}")
 
 
-def check_required_tags(content, filepath):
-    findings = []
+def check_file(text, filename):
+    """Run all 5 checks against one file's text."""
 
-    # skip files with no AWS resources
-    if not re.search(r'resource\s+"aws_', content):
-        return findings
+    # 1. Tags — just look for each required word anywhere in the file
+    if 'resource "aws_' in text:
+        for tag in REQUIRED_TAGS:
+            if tag not in text:
+                report("HIGH", f"missing tag '{tag}'", filename)
 
-    # find the tags block inside the file
-    tag_block = re.search(r'tags\s*=\s*\{([^}]+)\}', content)
+    # 2. Naming convention — resource name should split into 3 pieces by "-"
+    for name in re.findall(r'resource\s+"[\w]+"\s+"([\w-]+)"', text):
+        if len(name.split("-")) != 3:
+            report("MEDIUM", f"resource name '{name}' should look like project-env-purpose", filename)
 
-    # if no tags block exists at all
-    if not tag_block:
-        findings.append(make_finding(
-            severity="HIGH",
-            rule_id="TAG-001",
-            title="Missing tags block",
-            file=filepath,
-            line=1,
-            remediation="Add a tags block with: Environment, Owner, Project, DataClassification"
-        ))
-        return findings
-
-    # extract which tags are present
-    tags_found = set(re.findall(r'(\w+)\s*=', tag_block.group(1)))
-
-    # check each required tag individually
-    for tag in REQUIRED_TAGS:
-        if tag not in tags_found:
-            findings.append(make_finding(
-                severity="HIGH",
-                rule_id="TAG-001",
-                title=f"Missing required tag: {tag}",
-                file=filepath,
-                line=1,
-                remediation=f"Add '{tag}' to the tags block"
-            ))
-
-    return findings
-
-def check_naming_convention(content, filepath):
-    findings = []
-
-    # extract all resource names from the file
-    # terraform resource syntax: resource "type" "name"
-    resources = re.findall(r'resource\s+"[\w]+"\s+"([\w-]+)"', content)
-
-    for name in resources:
-        if not re.match(NAMING_PATTERN, name):
-            findings.append(make_finding(
-                severity="MEDIUM",
-                rule_id="NAME-001",
-                title=f"Resource name does not follow convention: {name}",
-                file=filepath,
-                line=1,
-                remediation="Rename to follow pattern: {project}-{env}-{purpose}"
-            ))
-
-    return findings
-
-
-def check_approved_regions(content, filepath):
-    findings = []
-
-    # find any hardcoded region strings in the file
-    regions_found = re.findall(r'"([a-z]+-[a-z]+-[0-9])"', content)
-
-    for region in regions_found:
+    # 3. Regions — anything shaped like "xx-xxxx-1" that isn't on the approved list
+    for region in re.findall(r'"([a-z]+-[a-z]+-\d)"', text):
         if region not in APPROVED_REGIONS:
-            findings.append(make_finding(
-                severity="HIGH",
-                rule_id="RGN-001",
-                title=f"Unapproved region detected: {region}",
-                file=filepath,
-                line=1,
-                remediation=f"Only use approved regions: {APPROVED_REGIONS}"
-            ))
+            report("HIGH", f"region '{region}' is not approved", filename)
 
-    return findings
+    # 4. Hardcoded account IDs — any quoted 12-digit number
+    for account_id in re.findall(r'"\d{12}"', text):
+        report("CRITICAL", f"hardcoded account ID {account_id}", filename)
 
-
-
-def check_hardcoded_account_ids(content, filepath):
-    findings = []
-
-    matches = re.finditer(ACCOUNT_ID_PATTERN, content)
-
-    for match in matches:
-        line = content[:match.start()].count("\n") + 1
-        findings.append(make_finding(
-            severity="CRITICAL",
-            rule_id="ACCT-001",
-            title="Hardcoded AWS account ID detected",
-            file=filepath,
-            line=line,
-            remediation="Replace with var.aws_account_id"
-        ))
-
-    return findings
-
-def check_s3_logging(content, filepath):
-    findings = []
-
-    # only check files that define S3 buckets
-    if not re.search(r'resource\s+"aws_s3_bucket"', content):
-        return findings
-
-    # check if logging configuration exists
-    if not re.search(r'aws_s3_bucket_logging', content):
-        findings.append(make_finding(
-            severity="MEDIUM",
-            rule_id="S3-001",
-            title="S3 bucket missing access logging configuration",
-            file=filepath,
-            line=1,
-            remediation="Add an aws_s3_bucket_logging resource pointing to a log bucket"
-        ))
-
-    return findings
-
-
-# all rule functions in one list
-# to add a new rule later, just append it here
-RULES = [
-    check_required_tags,
-    check_naming_convention,
-    check_approved_regions,
-    check_hardcoded_account_ids,
-    check_s3_logging,
-]
-
-
-def scan(path):
-    findings = []
-    tf_files = find_tf_files(path)
-
-    if not tf_files:
-        print(f"No .tf files found in {path}")
-        return findings
-
-    # run every rule against every file
-    for tf_file in tf_files:
-        content = tf_file.read_text(encoding="utf-8", errors="ignore")
-        for rule in RULES:
-            findings.extend(rule(content, str(tf_file)))
-
-    return findings
-
-
-
-def print_report(findings):
-    if not findings:
-        print("✅ No findings. All checks passed.")
-        return
-
-    # sort by severity — CRITICAL first, then HIGH, then MEDIUM
-    order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2}
-    findings.sort(key=lambda f: order[f["severity"]])
-
-    print(f"\n{'─' * 60}")
-    print(f"  Custom Scanner — {len(findings)} finding(s)")
-    print(f"{'─' * 60}\n")
-
-    for f in findings:
-        icon = {"CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡"}[f["severity"]]
-        print(f"{icon} [{f['severity']}] {f['rule_id']}: {f['title']}")
-        print(f"   File:        {f['file']}:{f['line']}")
-        print(f"   Remediation: {f['remediation']}")
-        print()
+    # 5. S3 logging — every bucket needs a logging resource somewhere in the file
+    if 'resource "aws_s3_bucket"' in text and "aws_s3_bucket_logging" not in text:
+        report("MEDIUM", "S3 bucket has no logging resource", filename)
 
 
 def main():
-    # define command line arguments
-    parser = argparse.ArgumentParser(description="Custom Terraform Security Scanner")
-    parser.add_argument("--path", default=".", help="Path to scan")
-    parser.add_argument("--fail-on-findings", action="store_true",
-                        help="Exit 1 if CRITICAL or HIGH findings exist")
-    args = parser.parse_args()
+    # allow an optional folder argument, otherwise scan current folder
+    folder = sys.argv[1] if len(sys.argv) > 1 else "."
 
-    # run the scan
-    findings = scan(args.path)
+    tf_files = list(Path(folder).rglob("*.tf"))
+    if not tf_files:
+        print(f"No .tf files found in {folder}")
+        return
 
-    # print the report
-    print_report(findings)
+    for tf_file in tf_files:
+        text = tf_file.read_text(encoding="utf-8", errors="ignore")
+        check_file(text, str(tf_file))
 
-    # fail the pipeline if critical or high findings exist
-    if args.fail_on_findings:
-        for f in findings:
-            if f["severity"] in ("CRITICAL", "HIGH"):
-                sys.exit(1)
+    print(f"\n{problem_count} total problem(s), {serious_problem_count} serious (CRITICAL/HIGH)")
+
+    # fail the pipeline (non-zero exit code) if anything serious was found
+    if serious_problem_count > 0:
+        sys.exit(1)
 
 
-# entry point — only runs when script is executed directly
-# not when imported as a module
 if __name__ == "__main__":
     main()
