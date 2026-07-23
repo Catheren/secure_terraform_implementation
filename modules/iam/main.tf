@@ -19,7 +19,9 @@ resource "aws_iam_instance_profile" "this" {
 
 resource "aws_iam_role" "ec2_role" {
   name = var.role_name
-
+  
+#only trust policy is in the project as of now, no permission policy is defined. Excluded from the scope
+#so, if this role is applied, as the role currently has zero actual permissions
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
