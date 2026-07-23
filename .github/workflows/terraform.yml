@@ -45,7 +45,8 @@ jobs:
         with:
           terraform_version: 1.7.0
 
-      # -backend=false skips remote state initialisation.
+      # -backend=false skips remote state initialisation. 
+      # otherwise terraform init tries to connect to a remote backend
       # The runner has no AWS credentials — this keeps init
       # fast and credential-free while still downloading
       # providers needed for validate to work correctly.
