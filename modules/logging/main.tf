@@ -20,7 +20,9 @@ resource "aws_cloudtrail" "this" {
 
 resource "aws_s3_bucket_policy" "trail_policy" {
   bucket = aws_s3_bucket.trail_bucket.id
-
+  #AWSCloudTrailAclCheck is a statement that lets the CloudTrail service itself — a literal AWS service principal- 
+  #check the bucket's ACL before writing. AWS requires this specific permission check as
+  #part of how CloudTrail confirms it's allowed to deliver logs to this bucket — it's a prerequisite handshake AWS documents
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
